@@ -31,7 +31,6 @@ import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
-import io.netty.handler.timeout.ReadTimeoutException;
 import io.netty.util.internal.StringUtil;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -44,11 +43,6 @@ final class HttpDownloadHandler extends AbstractHttpHandler<HttpObject> {
   private boolean keepAlive = HttpVersion.HTTP_1_1.isKeepAliveDefault();
   private boolean downloadSucceeded;
   private HttpResponse response;
-
-  private long bytesReceived;
-  private long contentLength = -1;
-  /** the path header in the http request */
-  private String path;
 
   public HttpDownloadHandler(Credentials credentials) {
     super(credentials);
@@ -78,17 +72,12 @@ final class HttpDownloadHandler extends AbstractHttpHandler<HttpObject> {
         failAndClose(error, ctx);
         return;
       }
-      boolean contentLengthSet = HttpUtil.isContentLengthSet(response);
-      if (!contentLengthSet && !HttpUtil.isTransferEncodingChunked(response)) {
+      if (!HttpUtil.isContentLengthSet(response) && !HttpUtil.isTransferEncodingChunked(response)) {
         HttpException error =
             new HttpException(
                 response, "Missing 'Content-Length' or 'Transfer-Encoding: chunked' header", null);
         failAndClose(error, ctx);
         return;
-      }
-
-      if (contentLengthSet) {
-        contentLength = HttpUtil.getContentLength(response);
       }
       downloadSucceeded = response.status().equals(HttpResponseStatus.OK);
       if (!downloadSucceeded) {
@@ -101,9 +90,7 @@ final class HttpDownloadHandler extends AbstractHttpHandler<HttpObject> {
       checkState(response != null, "content before headers");
 
       ByteBuf content = ((HttpContent) msg).content();
-      int readableBytes = content.readableBytes();
-      content.readBytes(out, readableBytes);
-      bytesReceived += readableBytes;
+      content.readBytes(out, content.readableBytes());
       if (msg instanceof LastHttpContent) {
         if (downloadSucceeded) {
           succeedAndReset(ctx);
@@ -131,10 +118,8 @@ final class HttpDownloadHandler extends AbstractHttpHandler<HttpObject> {
               "Unsupported message type: " + StringUtil.simpleClassName(msg)));
       return;
     }
-    DownloadCommand cmd = (DownloadCommand) msg;
-    out = cmd.out();
-    path = constructPath(cmd.uri(), cmd.hash(), cmd.casDownload());
-    HttpRequest request = buildRequest(path, constructHost(cmd.uri()));
+    out = ((DownloadCommand) msg).out();
+    HttpRequest request = buildRequest((DownloadCommand) msg);
     addCredentialHeaders(request, ((DownloadCommand) msg).uri());
     ctx.writeAndFlush(request)
         .addListener(
@@ -145,19 +130,13 @@ final class HttpDownloadHandler extends AbstractHttpHandler<HttpObject> {
             });
   }
 
-  @Override
-  public void exceptionCaught(ChannelHandlerContext ctx, Throwable t) {
-    if (t instanceof ReadTimeoutException) {
-      super.exceptionCaught(ctx, new DownloadTimeoutException(path, bytesReceived, contentLength));
-    } else {
-      super.exceptionCaught(ctx, t);
-    }
-  }
-
-  private HttpRequest buildRequest(String path, String host) {
+  private HttpRequest buildRequest(DownloadCommand request) {
     HttpRequest httpRequest =
-        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, path);
-    httpRequest.headers().set(HttpHeaderNames.HOST, host);
+        new DefaultFullHttpRequest(
+            HttpVersion.HTTP_1_1,
+            HttpMethod.GET,
+            constructPath(request.uri(), request.hash(), request.casDownload()));
+    httpRequest.headers().set(HttpHeaderNames.HOST, constructHost(request.uri()));
     httpRequest.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.KEEP_ALIVE);
     httpRequest.headers().set(HttpHeaderNames.ACCEPT, "*/*");
     return httpRequest;
